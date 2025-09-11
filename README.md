@@ -1,194 +1,216 @@
---[[
-  Teleporte Inteligente v3.1
-  • Calibração inicial de ping/FPS
-  • HUD com estatísticas em tempo real
-  • Busca servidores “vazios” (≤ MAX_PLAYERS)
-  • TeleportToPlaceInstance ou fallback aleatório
-  • Exponential backoff + retry até MAX_ATTEMPTS
-  • Sem filtro de amigos — global
-]]
+-- FPS Booster Ultimate v5.0
+-- Créditos: “Sua mãe”, @PepsiMannumero1 & @Lr-Scripts
 
--- Serviços
-local HttpService     = game:GetService("HttpService")
-local TeleportService = game:GetService("TeleportService")
-local Players         = game:GetService("Players")
-local RunService      = game:GetService("RunService")
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local Workspace         = game:GetService("Workspace")
+local Lighting          = game:GetService("Lighting")
+local CollectionService = game:GetService("CollectionService")
 
--- Referências
-local player  = Players.LocalPlayer
-local placeId = game.PlaceId
+local player    = Players.LocalPlayer
+local PlayerGui = player:WaitForChild("PlayerGui")
 
--- CONFIGURAÇÃO
-local CALIBRATE_TIME   = 5     -- segundos de calibração
-local SAMPLE_INTERVAL  = 0.1   -- intervalo de amostragem (s)
-local MAX_PLAYERS      = 2     -- instâncias com até X jogadores são "vazias"
-local PAGE_LIMIT       = 100   -- servidores por página na API
-local MAX_ATTEMPTS     = 3     -- tentativas de teleporte
-local PING_SAFETY_X    = 1.2   -- multiplica avgPing para threshold
-local FPS_SAFETY_X     = 0.9   -- multiplica avgFps para threshold
-local BACKOFF_BASE     = 2     -- base do backoff exponencial
-local HUD_INTERVAL     = 1     -- atualização do HUD (s)
+-- == CONFIGURAÇÃO ==
+local BATCH_SIZE       = 20     -- quantos objetos otimizar por frame
+local SAMPLE_SIZE      = 30     -- tamanho do buffer de FPS
+local FPS_THRESHOLD    = 75     -- título para ativar booster
+local LOBBY_DELAY      = 10     -- segundos antes de otimizar após spawn
+local STREAM_WAIT      = 1      -- segundos para carregar todo o lobby
+local CREDIT_TIME      = 1.4    -- segundos por crédito na tela
 
--- Estado
-local pingSamples = {}       -- armazena amostras de ping
-local fpsSamples  = {}       -- armazena amostras de FPS
-local attempts    = 0        -- contador de tentativas
-local PING_THRESHOLD, FPS_THRESHOLD
+-- == 1) CRÉDITOS ==
+local function showCredits()
+    local texts = {
+        "FPS Booster ativado!",
+        "@PepsiMannumero1 & @Lr-Scripts",
+        "Sua mãe"
+    }
+    for _, txt in ipairs(texts) do
+        local gui = Instance.new("ScreenGui")
+        gui.Name         = "FB_Credits"
+        gui.ResetOnSpawn = false
+        gui.Parent       = PlayerGui
 
--- 1) Calibração de ping e FPS
-local function calibrate()
-    local startTime = tick()
-    local conn
-    conn = RunService.Heartbeat:Connect(function(dt)
-        if tick() - startTime > CALIBRATE_TIME then
-            conn:Disconnect()
-            return
-        end
-        fpsSamples[#fpsSamples+1]  = 1/dt
-        pingSamples[#pingSamples+1] = player:GetNetworkPing() * 1000
-    end)
+        local frame = Instance.new("Frame", gui)
+        frame.Size              = UDim2.new(0.4, 0, 0.1, 0)
+        frame.Position          = UDim2.new(0.5, 0, 0.8, 0)
+        frame.AnchorPoint       = Vector2.new(0.5, 0.5)
+        frame.BackgroundColor3  = Color3.fromRGB(30, 30, 30)
+        frame.BorderSizePixel   = 0
+        Instance.new("UICorner", frame).CornerRadius = UDim.new(0.2, 0)
 
-    repeat task.wait(SAMPLE_INTERVAL)
-    until tick() - startTime >= CALIBRATE_TIME
+        local label = Instance.new("TextLabel", frame)
+        label.Size                   = UDim2.new(1, 0, 1, 0)
+        label.BackgroundTransparency = 1
+        label.Font                   = Enum.Font.GothamBold
+        label.TextScaled             = true
+        label.TextWrapped            = true
+        label.TextColor3             = Color3.fromRGB(0, 174, 255)
+        label.Text                   = txt
 
-    local sumPing, sumFps = 0, 0
-    for _, p in ipairs(pingSamples) do sumPing = sumPing + p end
-    for _, f in ipairs(fpsSamples)  do sumFps  = sumFps  + f end
-
-    local avgPing = sumPing  / #pingSamples
-    local avgFps  = sumFps   / #fpsSamples
-
-    PING_THRESHOLD = avgPing * PING_SAFETY_X
-    FPS_THRESHOLD  = avgFps  * FPS_SAFETY_X
-
-    return avgPing, avgFps
-end
-
--- 2) HUD de estatísticas
-local hud = {}
-local function createHUD()
-    local gui = Instance.new("ScreenGui", player:WaitForChild("PlayerGui"))
-    gui.Name = "TeleportHUD"
-
-    local frame = Instance.new("Frame", gui)
-    frame.Size             = UDim2.new(0, 240, 0, 60)
-    frame.Position         = UDim2.new(0, 10, 0, 10)
-    frame.BackgroundColor3 = Color3.new(0, 0, 0)
-    frame.BackgroundTransparency = 0.3
-    frame.BorderSizePixel  = 0
-
-    local function newLabel(y)
-        local lbl = Instance.new("TextLabel", frame)
-        lbl.Size               = UDim2.new(1, -10, 0, 20)
-        lbl.Position           = UDim2.new(0, 5, 0, y)
-        lbl.BackgroundTransparency = 1
-        lbl.Font               = Enum.Font.SourceSans
-        lbl.TextSize           = 18
-        lbl.TextColor3         = Color3.new(1, 1, 1)
-        return lbl
+        task.delay(CREDIT_TIME, function()
+            gui:Destroy()
+        end)
+        task.wait(CREDIT_TIME)
     end
-
-    hud.ping   = newLabel(0)
-    hud.fps    = newLabel(20)
-    hud.status = newLabel(40)
 end
+task.spawn(showCredits)
 
-local function startHUD()
-    spawn(function()
-        while attempts < MAX_ATTEMPTS do
-            local curPing = math.floor(player:GetNetworkPing() * 1000 + 0.5)
-            local lastFps = math.floor((fpsSamples[#fpsSamples] or 0) + 0.5)
-            hud.ping.Text   = ("Ping: %d ms / Thr: %d"):format(curPing, math.floor(PING_THRESHOLD))
-            hud.fps.Text    = ("FPS: %d / Thr: %d"):format(lastFps,  math.floor(FPS_THRESHOLD))
-            hud.status.Text = ("Tentativa: %d/%d"):format(attempts, MAX_ATTEMPTS)
-            task.wait(HUD_INTERVAL)
-        end
-    end)
-end
+-- == 2) QUALIDADE GRÁFICA MÍNIMA ==
+pcall(function()
+    settings().Rendering.QualityLevel            = 1
+    settings().Rendering.MeshPartDetailLevel     = Enum.MeshPartDetailLevel.Low
+    settings().Rendering.EagerBulkExecution       = false
+    settings().Rendering.InterpolationThrottling = true
+end)
 
--- 3) Busca servidores via API (global)
-local function fetchServers(cursor)
-    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=%d")
-        :format(placeId, PAGE_LIMIT)
-    if cursor then
-        url = url .. "&cursor=" .. cursor
+-- == 3) ILUMINAÇÃO BALANCEADA ==
+-- ambiente suave para visibilidade
+Lighting.Ambient           = Color3.fromRGB(80, 80, 80)
+Lighting.OutdoorAmbient    = Color3.fromRGB(80, 80, 80)
+Lighting.ColorShift_Bottom = Color3.fromRGB(0,   0,  0)
+Lighting.ColorShift_Top    = Color3.fromRGB(0,   0,  0)
+Lighting.FogStart          = 0
+Lighting.FogEnd            = 1e5
+Lighting.GlobalShadows     = false
+
+-- desativa efeitos caros
+for _, eff in ipairs(Lighting:GetDescendants()) do
+    if eff:IsA("PostEffect") then
+        eff.Enabled = false
+        eff:GetPropertyChangedSignal("Enabled"):Connect(function()
+            eff.Enabled = false
+        end)
     end
-
-    local ok, response = pcall(HttpService.GetAsync, HttpService, url)
-    if not ok then
-        return {}, nil
+end
+Lighting.DescendantAdded:Connect(function(inst)
+    if inst:IsA("PostEffect") then
+        inst.Enabled = false
     end
+end)
 
-    local success, data = pcall(HttpService.JSONDecode, HttpService, response)
-    if not success or type(data) ~= "table" then
-        return {}, nil
+-- remove sombras e reduz brilho das luzes
+for _, inst in ipairs(Workspace:GetDescendants()) do
+    if inst:IsA("BasePart") then
+        inst.CastShadow = false
+    elseif inst:IsA("Light") then
+        pcall(function()
+            inst.Brightness = math.clamp((inst.Brightness or 1) * 0.6, 0.3, 1)
+            inst.Range      = math.clamp((inst.Range      or 8) * 0.6, 4, 16)
+        end)
     end
+end
+Workspace.DescendantAdded:Connect(function(inst)
+    if inst:IsA("BasePart") then
+        inst.CastShadow = false
+    elseif inst:IsA("Light") then
+        pcall(function()
+            inst.Brightness = math.clamp((inst.Brightness or 1) * 0.6, 0.3, 1)
+            inst.Range      = math.clamp((inst.Range      or 8) * 0.6, 4, 16)
+        end)
+    end
+end)
 
-    return data.data or {}, data.nextPageCursor
+-- luz de preenchimento discreta na câmera
+local cam = workspace.CurrentCamera
+if cam then
+    local fill = Instance.new("PointLight", cam)
+    fill.Name       = "FB_FillLight"
+    fill.Range      = 60
+    fill.Brightness = 0.5
+    fill.Shadows    = false
 end
 
--- 4) Seleciona o servidor com menor população (≤ MAX_PLAYERS de preferência)
-local function findBestServer()
-    local cursor
-    local bestId, lowestCount = nil, math.huge
-
-    repeat
-        local list, nextCursor = fetchServers(cursor)
-        for _, srv in ipairs(list) do
-            local cnt = srv.playing or math.huge
-            if cnt <= MAX_PLAYERS then
-                return srv.id
-            end
-            if cnt < lowestCount then
-                lowestCount, bestId = cnt, srv.id
-            end
-        end
-        cursor = nextCursor
-    until not cursor
-
-    return bestId
-end
-
--- 5) Teleporte inteligente com backoff exponencial
-local function smartTeleport(attempt)
-    if attempt > MAX_ATTEMPTS then
-        hud.status.Text = "Processo concluído"
+-- == 4) FUNÇÃO DE OTIMIZAÇÃO ==
+local function optimize(obj)
+    if CollectionService:HasTag(obj, "FB_Optimized") then
         return
     end
+    CollectionService:AddTag(obj, "FB_Optimized")
 
-    -- Se FPS abaixo do limiar, espera backoff
-    local lastFps = fpsSamples[#fpsSamples] or 0
-    if lastFps < FPS_THRESHOLD then
-        local waitTime = BACKOFF_BASE ^ (attempt - 1)
-        hud.status.Text = ("Aguardando %d s por FPS"):format(waitTime)
-        task.wait(waitTime)
-    end
-
-    attempts = attempt
-    hud.status.Text = ("Buscando instância (%d/%d)"):format(attempt, MAX_ATTEMPTS)
-    local targetId = findBestServer()
-
-    if targetId then
-        hud.status.Text = "Teleportando para servidor " .. targetId
-        TeleportService:TeleportToPlaceInstance(placeId, targetId, player)
-    else
-        hud.status.Text = "Fallback: teleport aleatório"
-        TeleportService:Teleport(placeId, player)
-    end
-
-    -- Após backoff + 1 s, verifica ping e possivelmente repete
-    task.delay((BACKOFF_BASE ^ (attempt - 1)) + 1, function()
-        local newPing = player:GetNetworkPing() * 1000
-        if newPing < PING_THRESHOLD then
-            smartTeleport(attempt + 1)
-        else
-            hud.status.Text = ("Ping aceitável (%d ms) — fim"):format(math.floor(newPing + 0.5))
+    pcall(function()
+        if obj:IsA("ParticleEmitter")
+        or obj:IsA("Trail")
+        or obj:IsA("Smoke")
+        or obj:IsA("Sparkles")
+        or obj:IsA("Fire")
+        or obj:IsA("Explosion") then
+            obj.Enabled  = false
+            obj.Rate     = obj.Rate     and 0 or nil
+            obj.Lifetime = NumberRange.new(0)
+        elseif obj:IsA("BasePart") then
+            obj.Material    = Enum.Material.SmoothPlastic
+            obj.CastShadow  = false
+            obj.Reflectance = 0
         end
     end)
 end
 
--- Execução principal
-local avgPing, avgFps = calibrate()
-createHUD()
-startHUD()
-smartTeleport(1)
+-- == 5) OTIMIZAÇÃO GLOBAL DO LOBBY ==
+workspace.StreamingEnabled = false
+task.wait(STREAM_WAIT)
+for _, inst in ipairs(Workspace:GetDescendants()) do
+    optimize(inst)
+end
+workspace.StreamingEnabled = true
+
+-- == 6) QUEUE E RESET ==
+local optimizeQueue = {}
+local fpsBuffer     = {}
+local boosterActive = false
+
+local function enqueue(obj)
+    optimizeQueue[#optimizeQueue + 1] = obj
+end
+
+local function resetState()
+    optimizeQueue = {}
+    fpsBuffer     = {}
+    boosterActive = false
+    task.delay(LOBBY_DELAY, function()
+        boosterActive = false
+    end)
+end
+
+player.CharacterAdded:Connect(resetState)
+resetState()
+
+-- == 7) HEARTBEAT & BOOSTER ==
+RunService.Heartbeat:Connect(function(dt)
+    if boosterActive then
+        -- já ativo: continua processando fila
+    elseif #fpsBuffer < SAMPLE_SIZE then
+        -- enche buffer até SAMPLE_SIZE antes de checar
+    else
+        -- calcula média
+        local sum = 0
+        for _, v in ipairs(fpsBuffer) do sum += v end
+        local avg = sum / #fpsBuffer
+        if avg < FPS_THRESHOLD then
+            boosterActive = true
+            for _, o in ipairs(Workspace:GetDescendants()) do
+                enqueue(o)
+            end
+        end
+    end
+
+    -- atualiza buffer de FPS
+    fpsBuffer[#fpsBuffer + 1] = 1/dt
+    if #fpsBuffer > SAMPLE_SIZE then
+        table.remove(fpsBuffer, 1)
+    end
+
+    -- processa até BATCH_SIZE objetos
+    for i = 1, BATCH_SIZE do
+        local obj = table.remove(optimizeQueue, 1)
+        if not obj then break end
+        optimize(obj)
+    end
+end)
+
+-- == 8) OTIMIZAÇÃO DINÂMICA ==
+Workspace.DescendantAdded:Connect(function(obj)
+    if boosterActive then
+        enqueue(obj)
+    end
+end)
